@@ -1,37 +1,67 @@
 import gradio as gr
 import torch
-import diffusers
-import transformers
-import copy
-import random
 import numpy as np
 import torchvision.transforms as T
 import math
 import peft
+import os
+import sys
 from peft import LoraConfig
 from safetensors import safe_open
 from omegaconf import OmegaConf
-import os
-os.environ["GRADIO_TEMP_DIR"] = ".gradio"
+from pathlib import Path
+
+# --- Import Project Modules ---
+# Ensure the current directory is in python path to find 'omnitry'
+current_dir = Path(__file__).resolve().parent
+sys.path.append(str(current_dir))
 
 from omnitry.models.transformer_flux import FluxTransformer2DModel
 from omnitry.pipelines.pipeline_flux_fill import FluxFillPipeline
 
-
+# --- Configuration & Setup ---
+os.environ["GRADIO_TEMP_DIR"] = str(current_dir / ".gradio")
 device = torch.device('cuda:0')
 weight_dtype = torch.bfloat16
-args = OmegaConf.load('configs/omnitry_v1_unified.yaml')
 
-# init model & pipeline
-transformer = FluxTransformer2DModel.from_pretrained(f'{args.model_root}/transformer').requires_grad_(False).to(dtype=weight_dtype)
-pipeline = FluxFillPipeline.from_pretrained(args.model_root, transformer=transformer.eval(), torch_dtype=weight_dtype)
+# Robust config loading (handles running from different dirs)
+config_path = current_dir / 'configs' / 'omnitry_v1_unified.yaml'
+args = OmegaConf.load(str(config_path))
 
-# VRAM saving, comment the follwing lines if you have sufficient memory
-pipeline.enable_model_cpu_offload()
+# --- Model Initialization ---
+print("Loading Transformer...")
+transformer = FluxTransformer2DModel.from_pretrained(
+    f'{args.model_root}/transformer'
+).requires_grad_(False).to(dtype=weight_dtype)
+
+print("Loading Pipeline...")
+pipeline = FluxFillPipeline.from_pretrained(
+    args.model_root, 
+    transformer=transformer.eval(), 
+    torch_dtype=weight_dtype
+)
+
+# --- 🚀 OPTIMIZATION: Smart VRAM Management ---
+# The L40S has 48GB VRAM. The model peaks at ~26GB.
+# Offloading to CPU slows things down massively. We only offload if VRAM is tight.
+if torch.cuda.is_available():
+    total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    print(f"Detected VRAM: {total_vram_gb:.1f} GB")
+
+    if total_vram_gb > 40:
+        print("✨ High VRAM detected (L40S/A6000). Keeping model on GPU for maximum speed.")
+        pipeline.to(device)
+    else:
+        print("⚠️ Limited VRAM. Enabling CPU offload (Slower but saves memory).")
+        pipeline.enable_model_cpu_offload()
+else:
+    print("⚠️ No CUDA detected. Running on CPU (Will be very slow).")
+
 pipeline.vae.enable_tiling()
 
 
-# insert LoRA
+# --- LoRA Setup ---
+print("Injecting LoRA adapters...")
 lora_config = LoraConfig(
     r=args.lora_rank,
     lora_alpha=args.lora_alpha,
@@ -51,13 +81,13 @@ with safe_open(args.lora_path, framework="pt") as f:
     lora_weights = {k: f.get_tensor(k) for k in f.keys()}
     transformer.load_state_dict(lora_weights, strict=False)
 
-# hack lora forward
-def create_hacked_forward(module):
 
+# --- Hacked LoRA Forward Pass ---
+# Keeps the original logic but wrapped cleanly
+def create_hacked_forward(module):
     def lora_forward(self, active_adapter, x, *args, **kwargs):
         result = self.base_layer(x, *args, **kwargs)
         if active_adapter is not None:
-            torch_result_dtype = result.dtype
             lora_A = self.lora_A[active_adapter]
             lora_B = self.lora_B[active_adapter]
             dropout = self.lora_dropout[active_adapter]
@@ -67,6 +97,7 @@ def create_hacked_forward(module):
         return result
     
     def hacked_lora_forward(self, x, *args, **kwargs):
+        # Forward pass splitting logic
         return torch.cat((
             lora_forward(self, 'vtryon_lora', x[:1], *args, **kwargs),
             lora_forward(self, 'garment_lora', x[1:], *args, **kwargs),
@@ -74,178 +105,117 @@ def create_hacked_forward(module):
     
     return hacked_lora_forward.__get__(module, type(module))
 
+# Apply the hack
 for n, m in transformer.named_modules():
     if isinstance(m, peft.tuners.lora.layer.Linear):
         m.forward = create_hacked_forward(m)
 
 
-def seed_everything(seed=0):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
+# --- Inference Function ---
 def generate(person_image, object_image, object_class, steps=20, guidance_scale=30, seed=-1, progress=gr.Progress(track_tqdm=True)):
-    # set seed
+    if person_image is None or object_image is None:
+        raise gr.Error("Please upload both a Person Image and an Object Image.")
+
+    # Handle Seed locally (Better for concurrency)
     if seed == -1:
-        seed = random.randint(0, 2**32 - 1)
-    seed_everything(seed)
+        seed = torch.randint(0, 2**32 - 1, (1,)).item()
+    generator = torch.Generator(device).manual_seed(int(seed))
+    
+    print(f"Generating with seed: {seed} | Steps: {steps} | Scale: {guidance_scale}")
 
-    # resize model
-    max_area = 1024 * 1024
-    oW = person_image.width
-    oH = person_image.height
-
-    ratio = math.sqrt(max_area / (oW * oH))
-    ratio = min(1, ratio)
+    # Resize logic (Person)
+    # 🚀 QUALITY BOOST: Increased from 1024x1024 to 1536x1536 (2.25x pixels)
+    # Your L40S has plenty of VRAM for this.
+    max_area = 1536 * 1536 
+    
+    oW, oH = person_image.width, person_image.height
+    ratio = min(1, math.sqrt(max_area / (oW * oH)))
     tW, tH = int(oW * ratio) // 16 * 16, int(oH * ratio) // 16 * 16
-    transform = T.Compose([
+    
+    transform_person = T.Compose([
         T.Resize((tH, tW)),
         T.ToTensor(),
     ])
-    person_image = transform(person_image)
+    person_tensor = transform_person(person_image)
 
-    # resize and padding garment
-    ratio = min(tW / object_image.width, tH / object_image.height)
-    transform = T.Compose([
-        T.Resize((int(object_image.height * ratio), int(object_image.width * ratio))),
+    # Resize logic (Object / Garment)
+    ratio_obj = min(tW / object_image.width, tH / object_image.height)
+    transform_obj = T.Compose([
+        T.Resize((int(object_image.height * ratio_obj), int(object_image.width * ratio_obj))),
         T.ToTensor(),
     ])
-    object_image_padded = torch.ones_like(person_image)
-    object_image = transform(object_image)
-    new_h, new_w = object_image.shape[1], object_image.shape[2]
+    
+    object_tensor = transform_obj(object_image)
+    
+    # Padding
+    object_image_padded = torch.ones_like(person_tensor)
+    new_h, new_w = object_tensor.shape[1], object_tensor.shape[2]
     min_x = (tW - new_w) // 2
     min_y = (tH - new_h) // 2
-    object_image_padded[:, min_y: min_y + new_h, min_x: min_x + new_w] = object_image
+    object_image_padded[:, min_y: min_y + new_h, min_x: min_x + new_w] = object_tensor
 
-    # prepare prompts & conditions
+    # Prepare batch
     prompts = [args.object_map[object_class]] * 2
-    img_cond = torch.stack([person_image, object_image_padded]).to(dtype=weight_dtype, device=device) 
+    img_cond = torch.stack([person_tensor, object_image_padded]).to(dtype=weight_dtype, device=device) 
     mask = torch.zeros_like(img_cond).to(img_cond)
 
     with torch.no_grad():
         img = pipeline(
             prompt=prompts,
             height=tH,
-            width=tW,    
+            width=tW,     
             img_cond=img_cond,
             mask=mask,
             guidance_scale=guidance_scale,
             num_inference_steps=steps,
-            generator=torch.Generator(device).manual_seed(seed),
+            generator=generator, # Use local generator
         ).images[0]
 
     return img
 
 
+# --- Gradio UI ---
 if __name__ == '__main__':
-
-    with gr.Blocks() as demo:
-        gr.Markdown('# Demo of OmniTry')
+    
+    # Define styles or custom CSS here if needed
+    with gr.Blocks(title="OmniTry Demo", theme=gr.themes.Base()) as demo:
+        gr.Markdown('# 👕 OmniTry: Virtual Try-On Demo')
+        gr.Markdown('Upload a person and a garment to generate a virtual try-on result.')
+        
         with gr.Row():
             with gr.Column():
-                person_image = gr.Image(type="pil", label="Person Image", height=800)
-                run_button = gr.Button(value="Submit", variant='primary')
+                person_image = gr.Image(type="pil", label="Person Image", sources=['upload', 'clipboard'], height=600)
+                object_image = gr.Image(type="pil", label="Garment Image", sources=['upload', 'clipboard'], height=600)
+                object_class = gr.Dropdown(label='Garment Type', choices=list(args.object_map.keys()), value="top clothes")
+                
+                with gr.Accordion("Advanced Settings", open=False):
+                    guidance_scale = gr.Slider(label="Guidance Scale", minimum=1, maximum=50, value=30, step=0.1)
+                    steps = gr.Slider(label="Inference Steps", minimum=1, maximum=50, value=20, step=1)
+                    seed = gr.Number(label="Seed (-1 for random)", value=-1, precision=0)
+                
+                run_button = gr.Button(value="✨ Generate Try-On", variant='primary', size="lg")
 
             with gr.Column():
-                object_image = gr.Image(type="pil", label="Object Image", height=800)
-                object_class = gr.Dropdown(label='Object Class', choices=args.object_map.keys())
+                image_out = gr.Image(type="pil", label="Result", height=800, interactive=False)
 
-            with gr.Column():
-                image_out = gr.Image(type="pil", label="Output", height=800)
+        # Connect the button
+        run_button.click(
+            fn=generate, 
+            inputs=[person_image, object_image, object_class, steps, guidance_scale, seed], 
+            outputs=[image_out]
+        )
 
-        with gr.Accordion("Advanced ⚙️", open=False):
-            guidance_scale = gr.Slider(label="Guidance scale", minimum=1, maximum=50, value=30, step=0.1)
-            steps = gr.Slider(label="Steps", minimum=1, maximum=50, value=20, step=1)
-            seed = gr.Number(label="Seed", value=-1, precision=0)
-
-        with gr.Row():
+        # Add Examples (Paths must exist in the container)
+        # Verify paths before adding to prevent broken UI
+        example_root = current_dir / "demo_example"
+        if example_root.exists():
             gr.Examples(
                 examples=[
-                    [
-                        './demo_example/person_top_cloth.jpg',
-                        './demo_example/object_top_cloth.jpg', 
-                        'top clothes',
-                    ],
-                    [
-                        './demo_example/person_bottom_cloth.jpg',
-                        './demo_example/object_bottom_cloth.jpg', 
-                        'bottom clothes',
-                    ],
-                    [
-                        './demo_example/person_dress.jpg',
-                        './demo_example/object_dress.jpg', 
-                        'dress',
-                    ],
-                    [
-                        './demo_example/person_shoes.jpg',
-                        './demo_example/object_shoes.jpg', 
-                        'shoe',
-                    ],
-                    [
-                        './demo_example/person_earrings.jpg',
-                        './demo_example/object_earrings.jpg', 
-                        'earrings',
-                    ],
-                    [
-                        './demo_example/person_bracelet.jpg',
-                        './demo_example/object_bracelet.jpg', 
-                        'bracelet',
-                    ],
-                    [
-                        './demo_example/person_necklace.jpg',
-                        './demo_example/object_necklace.jpg', 
-                        'necklace',
-                    ],
-                    [
-                        './demo_example/person_ring.jpg',
-                        './demo_example/object_ring.jpg', 
-                        'ring',
-                    ],
-                    [
-                        './demo_example/person_sunglasses.jpg',
-                        './demo_example/object_sunglasses.jpg', 
-                        'sunglasses',
-                    ],
-                    [
-                        './demo_example/person_glasses.jpg',
-                        './demo_example/object_glasses.jpg', 
-                        'glasses',
-                    ],
-                    [
-                        './demo_example/person_belt.jpg',
-                        './demo_example/object_belt.jpg', 
-                        'belt',
-                    ],
-                    [
-                        './demo_example/person_bag.jpg',
-                        './demo_example/object_bag.jpg', 
-                        'bag',
-                    ],
-                    [
-                        './demo_example/person_hat.jpg',
-                        './demo_example/object_hat.jpg', 
-                        'hat',
-                    ],
-                    [
-                        './demo_example/person_tie.jpg',
-                        './demo_example/object_tie.jpg', 
-                        'tie',
-                    ],
-                    [
-                        './demo_example/person_bowtie.jpg',
-                        './demo_example/object_bowtie.jpg', 
-                        'bow tie',
-                    ],
+                    [str(example_root/'person_top_cloth.jpg'), str(example_root/'object_top_cloth.jpg'), 'top clothes'],
+                    [str(example_root/'person_dress.jpg'), str(example_root/'object_dress.jpg'), 'dress'],
                 ],
-
                 inputs=[person_image, object_image, object_class],
-                examples_per_page=100
+                label="Quick Examples"
             )
-
-        run_button.click(generate, inputs=[person_image, object_image, object_class, steps, guidance_scale, seed], outputs=[image_out])
     
     demo.launch()
