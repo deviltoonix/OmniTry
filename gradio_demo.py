@@ -126,7 +126,7 @@ def generate(person_image, object_image, object_class, steps=20, guidance_scale=
     # Resize logic (Person)
     # 🚀 QUALITY BOOST: Increased from 1024x1024 to 1536x1536 (2.25x pixels)
     # Your L40S has plenty of VRAM for this.
-    max_area = 1536 * 1536 
+    max_area = 1280 * 1280 
     
     oW, oH = person_image.width, person_image.height
     ratio = min(1, math.sqrt(max_area / (oW * oH)))
