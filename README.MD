@@ -28,21 +28,19 @@
 </p>
 
 🚀 Easy Cloud Deployment (Modal)
-Want to run OmniTry in the cloud without setting up a complex computer? Follow these 5 simple steps. It's so easy, even a 6-year-old can do it!
+Want to run OmniTry in the cloud without setting up a complex computer? Follow these 5 simple steps.
 
 Step 1: Get a Modal Account
 Go to Modal.com and sign up. They usually give you some free credits to start!
 
 Step 2: Install the Modal Tool
-Open the "Terminal" on your computer (the black box where you type commands) and type this:
+Open the "Terminal" on your computer and type this:
+  pip install modal
 
-Bash
-pip install modal
 Step 3: Link Your Account
 Tell your computer who you are on Modal by typing:
 
-Bash
-modal setup
+  modal setup
 A window will pop up in your internet browser. Just click "Login".
 
 Step 4: Add Your Secret Key
@@ -52,15 +50,13 @@ Get your token from Hugging Face Settings.
 
 Type this in your terminal:
 
-Bash
 modal secret create hf-secret HF_TOKEN=your_token_here
 (Replace your_token_here with the long code from Hugging Face)
 
 Step 5: Launch the Demo! 🚀
 Now, just run the deployment script. This will set up the GPU, download the weights, and give you a website link to play with:
 
-Bash
-modal deploy final.py
+modal deploy modal_deploy.py
 That's it! Check the terminal for a link that ends in .modal.run. Click it to start your virtual try-on!
 
 💻 Local Get Started
