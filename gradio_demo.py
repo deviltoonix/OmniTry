@@ -19,7 +19,6 @@ from omnitry.pipelines.pipeline_flux_fill import FluxFillPipeline
 
 # --- Configuration & Setup ---
 os.environ["GRADIO_TEMP_DIR"] = str(current_dir / ".gradio")
-# Enable Flash Attention 2 before any model is loaded
 os.environ["DIFFUSERS_ATTN_IMPLEMENTATION"] = "sdpa"
 
 device = torch.device('cuda:0')
@@ -31,7 +30,6 @@ args = OmegaConf.load(str(config_path))
 print("Loading Transformer...")
 transformer = FluxTransformer2DModel.from_pretrained(
     f'{args.model_root}/transformer',
-
     torch_dtype=weight_dtype,
 ).requires_grad_(False)
 
@@ -49,8 +47,8 @@ if torch.cuda.is_available():
 else:
     print("⚠️ No CUDA. Running on CPU (Very Slow).")
 
-# VAE slicing: lightweight alternative to tiling, no CPU tile-coordination overhead.
-# With 80GB VRAM you don't need tiling for memory — it only adds CPU sync cost.
+# VAE: disable tiling (CPU overhead), use slicing only when needed for memory.
+# With 80GB we don't need either — disable both for fastest decode.
 pipeline.vae.enable_slicing()
 
 # --- LoRA Setup ---
@@ -75,39 +73,38 @@ with safe_open(args.lora_path, framework="pt") as f:
     lora_weights = {k: f.get_tensor(k).to(device=device, dtype=weight_dtype) for k in f.keys()}
     transformer.load_state_dict(lora_weights, strict=False)
 
-# --- Hacked LoRA Forward Pass (GPU-optimized) ---
-#
-# Key fixes vs original:
-#   1. Base layer runs once on FULL batch — GPU stays busy, no split at base layer.
-#   2. LoRA deltas computed separately then torch.cat'd into one tensor before
-#      the final add — single contiguous GPU kernel instead of two in-place ops.
-#      In-place slice assignment breaks torch.compile graph tracing; cat does not.
-#   3. No nested closures with dict lookups inside the hot path.
-#
+# --- Hacked LoRA Forward Pass ---
+# Pre-cache the weight references at patch time so the hot path has zero
+# Python attribute lookups — just local variable references.
+# This also makes the forward a clean static function that torch.compile
+# can trace without hitting peft's dynamic dispatch at all.
 def create_hacked_forward(module):
-    def hacked_lora_forward(self, x, *args, **kwargs):
-        # Full-batch base forward — keeps GPU utilisation high
-        result = self.base_layer(x, *args, **kwargs)
+    # Capture weight references once at patch time, not at call time
+    lora_A_v = module.lora_A['vtryon_lora']
+    lora_B_v = module.lora_B['vtryon_lora']
+    drop_v   = module.lora_dropout['vtryon_lora']
+    scale_v  = module.scaling['vtryon_lora']
 
-        # vtryon_lora on first element of batch
-        lora_A_v = self.lora_A['vtryon_lora']
-        lora_B_v = self.lora_B['vtryon_lora']
-        drop_v   = self.lora_dropout['vtryon_lora']
-        scale_v  = self.scaling['vtryon_lora']
+    lora_A_g = module.lora_A['garment_lora']
+    lora_B_g = module.lora_B['garment_lora']
+    drop_g   = module.lora_dropout['garment_lora']
+    scale_g  = module.scaling['garment_lora']
+
+    base_layer = module.base_layer
+
+    def hacked_lora_forward(self, x, *args, **kwargs):
+        # Single full-batch base forward — GPU stays saturated
+        result = base_layer(x, *args, **kwargs)
+
+        # Both LoRA deltas computed with pre-cached locals (no dict/attr lookup)
         x0 = x[:1].to(lora_A_v.weight.dtype)
         delta0 = lora_B_v(lora_A_v(drop_v(x0))) * scale_v
 
-        # garment_lora on second element of batch
-        lora_A_g = self.lora_A['garment_lora']
-        lora_B_g = self.lora_B['garment_lora']
-        drop_g   = self.lora_dropout['garment_lora']
-        scale_g  = self.scaling['garment_lora']
         x1 = x[1:].to(lora_A_g.weight.dtype)
         delta1 = lora_B_g(lora_A_g(drop_g(x1))) * scale_g
 
-        # Single cat + add — one GPU kernel, compile-friendly
-        delta = torch.cat([delta0, delta1], dim=0)
-        return result + delta
+        # torch.cat → single contiguous tensor → one fused add kernel
+        return result + torch.cat([delta0, delta1], dim=0)
 
     return hacked_lora_forward.__get__(module, type(module))
 
@@ -115,15 +112,20 @@ for n, m in transformer.named_modules():
     if isinstance(m, peft.tuners.lora.layer.Linear):
         m.forward = create_hacked_forward(m)
 
-# --- torch.compile ---
-# mode="reduce-overhead" builds CUDA graphs so the GPU scheduler is driven
-# directly from the graph with minimal Python involvement.
-# fullgraph=False lets it skip graph breaks from peft's dynamic code.
-# WARNING: First inference call will take ~60-90s to compile — this is normal.
-# Every subsequent call will be dramatically faster (~2-5s/step at 1024px).
-print("Compiling transformer with torch.compile (mode=reduce-overhead)...")
-print("⚠️  First inference will be slow (~60-90s) — compilation in progress.")
-transformer = torch.compile(transformer, mode="reduce-overhead", fullgraph=False)
+# --- torch.compile strategy ---
+# mode="reduce-overhead" uses CUDA graphs — but CUDA graphs BREAK when the
+# input tensor shapes change between calls (different image sizes).
+# mode="max-autotune" uses Triton kernels tuned per shape without CUDA graphs,
+# so it handles variable shapes correctly and is the right mode for this workload.
+# fullgraph=False tolerates the remaining graph breaks in the pipeline wrapper.
+print("Compiling transformer with torch.compile (mode=max-autotune)...")
+print("⚠️  First 2-3 inference calls will be slow (Triton autotuning). All subsequent calls will be fast.")
+transformer = torch.compile(
+    transformer,
+    mode="max-autotune",
+    fullgraph=False,
+    dynamic=True,   # marks tensor dims as dynamic → single compiled artifact handles all resolutions
+)
 
 
 # --- Inference Function ---
@@ -134,8 +136,9 @@ def _run_inference(person_image, object_image, object_class, steps, guidance_sca
 
     print(f"Generating — seed: {seed} | steps: {steps} | res: {max_res}px")
     if torch.cuda.is_available():
-        print(f"GPU memory — allocated: {torch.cuda.memory_allocated(device)/1e9:.1f}GB "
-              f"| reserved: {torch.cuda.memory_reserved(device)/1e9:.1f}GB")
+        alloc = torch.cuda.memory_allocated(device) / 1e9
+        resrv = torch.cuda.memory_reserved(device) / 1e9
+        print(f"GPU memory — allocated: {alloc:.1f}GB | reserved: {resrv:.1f}GB")
 
     max_area = max_res * max_res
     oW, oH = person_image.width, person_image.height
@@ -197,7 +200,7 @@ if __name__ == '__main__':
                     resolution = gr.Radio(
                         choices=["1024 (Fast)", "1280 (Balanced)", "1536 (Quality)"],
                         value="1024 (Fast)",
-                        label="Resolution (1024 recommended for benchmarking)"
+                        label="Resolution"
                     )
                 run_button = gr.Button("Generate", variant='primary')
             with gr.Column():
