@@ -20,7 +20,7 @@ from omnitry.pipelines.pipeline_flux_fill import FluxFillPipeline
 # --- Configuration & Setup ---
 os.environ["GRADIO_TEMP_DIR"] = str(current_dir / ".gradio")
 # Enable Flash Attention 2 before any model is loaded
-os.environ["DIFFUSERS_ATTN_IMPLEMENTATION"] = "flash_attention_2"
+os.environ["DIFFUSERS_ATTN_IMPLEMENTATION"] = "sdpa"
 
 device = torch.device('cuda:0')
 weight_dtype = torch.bfloat16
@@ -31,7 +31,7 @@ args = OmegaConf.load(str(config_path))
 print("Loading Transformer...")
 transformer = FluxTransformer2DModel.from_pretrained(
     f'{args.model_root}/transformer',
-    attn_implementation="flash_attention_2",  # FA2 → sdpa fallback if not installed
+
     torch_dtype=weight_dtype,
 ).requires_grad_(False)
 
